@@ -1,6 +1,7 @@
 #!/bin/bash
 # install-antiscanner.sh — установщик AntiScanner v3.3.6
 
+
 set -eE
 
 BOLD='\033[1m'; DIM='\033[2m'
