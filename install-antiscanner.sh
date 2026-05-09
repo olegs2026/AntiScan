@@ -1,13 +1,13 @@
 #!/bin/bash
-# install-antiscanner.sh — установщик AntiScanner v3.3.3 для Ubuntu 24.04
-# Все фиксы: pipefail+grep, check_internet, UFW cleanup, version compare, netcat
+# install-antiscanner.sh — установщик AntiScanner v3.3.6
+# Исправлено: AS_VERSION (вместо VERSION) чтобы не конфликтовать с os-release
 set -eE
-set -o pipefail
 
 BOLD='\033[1m'; DIM='\033[2m'
 B_CYAN='\033[1;36m'; B_GREEN='\033[1;32m'; B_YELLOW='\033[1;33m'
 B_RED='\033[1;31m'; B_MAGENTA='\033[1;35m'; B_WHITE='\033[1;37m'; NC='\033[0m'
 
+AS_VERSION="3.3.6"
 BIN="/usr/local/bin/antiscanner"
 BIN_REPORT_OLD="/usr/local/bin/antiscanner-report"
 CONF_DIR="/etc/antiscanner"
@@ -20,81 +20,164 @@ IPT_CHAIN="SCANNERS-BLOCK"
 IPSET_F2B="antiscanner-f2b"
 IPSET_HP="antiscanner-honeypot"
 
-INSTALLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 PWD_DIR="$(pwd)"
-
-EXISTING_ARTIFACTS=()
+INSTALLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 MODE=""
-HONEYPOT_PORTS=""
+EXISTING_ARTIFACTS=()
 
+# =============== Helpers ===============
 ok()    { echo -e "  ${B_GREEN}✓${NC} $*"; }
-fail()  { echo -e "  ${B_RED}✗${NC} $*" >&2; }
 warn()  { echo -e "  ${B_YELLOW}⚠${NC} $*"; }
 info()  { echo -e "  ${DIM}ⓘ${NC} $*"; }
 step()  { echo -e "\n${B_CYAN}▶ $*${NC}"; }
 
 die() {
     echo -e "\n${B_RED}✗ ОШИБКА: $*${NC}" >&2
-    echo -e "${B_YELLOW}Установка прервана на строке ${BASH_LINENO[0]}${NC}" >&2
     exit 1
 }
 trap 'die "Команда упала с кодом $?: \"$BASH_COMMAND\""' ERR
 
-# =============== Проверка Ubuntu 24.x ===============
-check_ubuntu_24() {
-    step "Проверка ОС — требуется Ubuntu 24.x"
+# =============== Безопасный счётчик ipset ===============
+ipset_count() {
+    local set_name="$1"
+    local cnt=0
+    if ipset list "$set_name" &>/dev/null; then
+        cnt=$(ipset list "$set_name" 2>/dev/null | grep -cE '^[0-9]' 2>/dev/null || true)
+        cnt="${cnt//[^0-9]/}"
+        cnt=${cnt:-0}
+    fi
+    echo "$cnt"
+}
+
+# =============== Проверка версии установленного скрипта ===============
+get_installed_version() {
+    if [ -f "$BIN" ]; then
+        grep -oP 'antiscanner v\K[0-9]+\.[0-9]+\.[0-9]+' "$BIN" 2>/dev/null | head -1 || echo "unknown"
+    else
+        echo "none"
+    fi
+}
+
+# =============== ПОЛНОЕ УДАЛЕНИЕ ===============
+full_uninstall() {
+    echo
+    echo -e "${B_RED}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${B_RED}║         ПОЛНОЕ УДАЛЕНИЕ ANTISCANNER v${AS_VERSION}                 ║${NC}"
+    echo -e "${B_RED}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo
+    read -rp "Введите yes для подтверждения: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo "Отмена."
+        return 1
+    fi
+
+    step "Остановка сервисов"
+    systemctl disable --now antiscanner-fail2ban antiscanner-honeypot \
+                       antiscanner-update antiscanner-unban.timer 2>/dev/null || true
+
+    step "Удаление systemd юнитов"
+    rm -f "$SD_DIR"/antiscanner-*.service "$SD_DIR"/antiscanner-*.timer 2>/dev/null || true
+    systemctl daemon-reload || true
+
+    step "Очистка iptables и ipset"
+    iptables -D INPUT -m set --match-set "$IPSET_F2B" src -j DROP 2>/dev/null || true
+    iptables -D INPUT -m set --match-set "$IPSET_HP" src -j DROP 2>/dev/null || true
+    ipset destroy "$IPSET_F2B" 2>/dev/null || true
+    ipset destroy "$IPSET_HP" 2>/dev/null || true
+
+    if command -v iptables-save >/dev/null 2>&1; then
+        local rl_rules=""
+        rl_rules=$(iptables-save 2>/dev/null | grep 'AntiScanner-RateLimit' || true)
+        if [ -n "$rl_rules" ]; then
+            echo "$rl_rules" | sed 's/^-A /-D /' | while read -r rule; do
+                eval "iptables $rule" 2>/dev/null || true
+            done
+            ok "Rate-limit правила удалены"
+        fi
+    fi
+
+    for c in iptables ip6tables; do
+        $c -D INPUT -j "$IPT_CHAIN" 2>/dev/null || true
+        $c -F "$IPT_CHAIN" 2>/dev/null || true
+        $c -X "$IPT_CHAIN" 2>/dev/null || true
+    done
+    ok "iptables цепочка $IPT_CHAIN удалена"
+
+    if command -v ufw >/dev/null 2>&1; then
+        local ufw_lines=""
+        ufw_lines=$(ufw status numbered 2>/dev/null | grep 'AntiScanner' || true)
+        if [ -n "$ufw_lines" ]; then
+            local removed=0 num
+            while IFS= read -r line; do
+                num=$(echo "$line" | grep -oE '^$$\s*[0-9]+$$' | tr -d '[] ' 2>/dev/null || true)
+                if [ -n "$num" ]; then
+                    ufw --force delete "$num" >/dev/null 2>&1 && removed=$((removed+1)) || true
+                fi
+            done <<< "$ufw_lines"
+            [ "$removed" -gt 0 ] && ok "UFW: удалено $removed правил" || true
+            ufw reload >/dev/null 2>&1 || true
+        fi
+    fi
+
+    step "Очистка CRON, rsyslog, logrotate и файлов"
+    (crontab -l 2>/dev/null | grep -vF 'antiscanner' || true) | crontab - 2>/dev/null || true
+    rm -f "$RSYSLOG_CONF" "$LOGROTATE_CONF" "$LOGROTATE_CONF_OLD" 2>/dev/null || true
+    systemctl restart rsyslog 2>/dev/null || true
+    rm -rf "$CONF_DIR" 2>/dev/null || true
+    rm -f /var/log/antiscanner_*.log "$BIN" "$BIN_REPORT_OLD" 2>/dev/null || true
+
+    echo
+    echo -e "${B_GREEN}AntiScanner полностью удалён${NC}"
+}
+
+# =============== Проверка ОС (изолированно от os-release) ===============
+check_ubuntu() {
+    step "Проверка операционной системы"
 
     if [ ! -f /etc/os-release ]; then
-        die "Файл /etc/os-release не найден"
+        die "Не удалось определить ОС"
     fi
 
-    set +u
-    . /etc/os-release
-    set -u
+    # Изолированное чтение чтобы не загрязнять пространство имён установщика
+    local os_id os_ver os_pretty
+    os_id=$(. /etc/os-release && echo "${ID:-}")
+    os_ver=$(. /etc/os-release && echo "${VERSION_ID:-}")
+    os_pretty=$(. /etc/os-release && echo "${PRETTY_NAME:-}")
 
-    if [ "${ID:-}" != "ubuntu" ]; then
-        echo
-        echo -e "${B_YELLOW}⚠ ОС: ${PRETTY_NAME:-${ID:-?}} (не Ubuntu)${NC}"
-        read -rp "Продолжить на свой риск? [y/N]: " a
-        [[ ! "$a" =~ ^[Yy]$ ]] && { echo "Отмена"; exit 0; }
+    if [ "$os_id" = "ubuntu" ]; then
+        if [[ "$os_ver" =~ ^24 ]]; then
+            ok "Ubuntu ${os_ver} — полностью поддерживается"
+        elif [[ "$os_ver" =~ ^22 ]]; then
+            ok "Ubuntu ${os_ver} — поддерживается"
+        else
+            warn "Ubuntu ${os_ver:-?} — рекомендуется 22.04 или 24.04"
+        fi
+    elif [ "$os_id" = "debian" ]; then
+        ok "Debian ${os_ver:-?} — поддерживается"
+    else
+        warn "Обнаружена ${os_pretty:-неизвестная ОС}"
+    fi
+}
+
+check_internet() {
+    step "Проверка интернета"
+    if ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 || curl -s --max-time 4 http://archive.ubuntu.com >/dev/null 2>&1; then
+        ok "Интернет доступен"
+    else
+        die "Нет подключения к интернету"
+    fi
+}
+
+ensure_main_script() {
+    if [ -f "$BIN" ]; then
+        local installed; installed=$(get_installed_version)
+        if [ "$installed" = "$AS_VERSION" ]; then
+            ok "Основной скрипт актуален (v$AS_VERSION)"
+        else
+            warn "Установлена v$installed, рядом v$AS_VERSION (можно обновить)"
+        fi
         return 0
     fi
-
-    if [[ "${VERSION_ID:-}" =~ ^24\. ]]; then
-        ok "Ubuntu ${VERSION_ID} (${VERSION_CODENAME:-}) — полностью поддерживается"
-    elif [[ "${VERSION_ID:-}" =~ ^22\. ]]; then
-        warn "Ubuntu ${VERSION_ID} — должно работать, но не тестировалось"
-        read -rp "Продолжить? [Y/n]: " a
-        [[ "$a" =~ ^[Nn]$ ]] && { echo "Отмена"; exit 0; }
-    else
-        warn "Ubuntu ${VERSION_ID:-?} — не 24.x"
-        read -rp "Продолжить? [y/N]: " a
-        [[ ! "$a" =~ ^[Yy]$ ]] && { echo "Отмена"; exit 0; }
-    fi
-
-    info "Ядро: $(uname -r)"
-    info "Архитектура: $(uname -m)"
-}
-
-# =============== Fallback-проверка интернета ===============
-check_internet() {
-    if command -v ping >/dev/null 2>&1; then
-        if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then return 0; fi
-        if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then return 0; fi
-    fi
-    if command -v curl >/dev/null 2>&1; then
-        if curl -s --max-time 5 --connect-timeout 3 -o /dev/null http://archive.ubuntu.com 2>/dev/null; then return 0; fi
-        if curl -s --max-time 5 --connect-timeout 3 -o /dev/null https://1.1.1.1 2>/dev/null; then return 0; fi
-    fi
-    if command -v getent >/dev/null 2>&1; then
-        if getent hosts archive.ubuntu.com >/dev/null 2>&1; then return 0; fi
-    fi
-    return 1
-}
-
-# =============== Поиск + сравнение версий основного скрипта ===============
-ensure_main_script() {
-    step "Проверка основного скрипта antiscanner"
 
     local candidates=(
         "$PWD_DIR/antiscanner"
@@ -102,287 +185,124 @@ ensure_main_script() {
         "$INSTALLER_DIR/antiscanner"
         "$INSTALLER_DIR/antiscanner.sh"
     )
-    local src="" c
+
+    local src=""
     for c in "${candidates[@]}"; do
-        [ -f "$c" ] && [ "$c" != "$BIN" ] && { src="$c"; break; }
+        if [ -f "$c" ]; then
+            src="$c"
+            break
+        fi
     done
 
-    _get_ver() {
-        grep -oE 'antiscanner v[0-9]+\.[0-9]+(\.[0-9]+)?' "$1" 2>/dev/null \
-            | head -1 | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' || echo "?"
-    }
-
-    # Вариант А: $BIN существует
-    if [ -f "$BIN" ]; then
-        local installed_ver; installed_ver=$(_get_ver "$BIN")
-
-        if [ -n "$src" ]; then
-            local new_ver; new_ver=$(_get_ver "$src")
-
-            if ! cmp -s "$src" "$BIN"; then
-                echo
-                warn "$BIN существует, но отличается от $src"
-                info "Установлена:      ${B_YELLOW}${installed_ver}${NC}"
-                info "Локальная копия:  ${B_GREEN}${new_ver}${NC}"
-                echo
-                read -rp "Обновить $BIN из $src? [Y/n]: " upd
-                if [[ ! "$upd" =~ ^[Nn]$ ]]; then
-                    cp "$src" "$BIN" || die "Не смог cp $src → $BIN"
-                    chmod +x "$BIN"
-                    ok "Обновлён до ${new_ver}: $src → $BIN"
-                else
-                    warn "Оставлена старая версия — возможны ошибки"
-                fi
-            else
-                ok "Основной скрипт (${installed_ver}) идентичен $src"
-            fi
-        else
-            ok "Основной скрипт уже установлен: $BIN (${installed_ver})"
-            if [[ "$installed_ver" =~ ^v3\.[0-2] ]]; then
-                warn "Версия ${installed_ver} устарела — рекомендуется v3.3.x"
-            fi
-        fi
-
-        [ -x "$BIN" ] || chmod +x "$BIN" || die "Не смог chmod +x $BIN"
-        return 0
-    fi
-
-    # Вариант Б: $BIN нет, но есть локальная копия
     if [ -n "$src" ]; then
         info "Найден: $src"
-        if ! head -5 "$src" 2>/dev/null | grep -q 'antiscanner'; then
-            warn "Файл не похож на antiscanner — продолжаем с риском"
-        fi
         mkdir -p "$(dirname "$BIN")"
-        cp "$src" "$BIN" || die "Не смог cp $src → $BIN"
-        chmod +x "$BIN" || die "Не смог chmod +x $BIN"
-        local new_ver; new_ver=$(_get_ver "$BIN")
-        ok "Скопирован (${new_ver}): $src → $BIN"
+        cp "$src" "$BIN"
+        chmod +x "$BIN"
+        ok "Скопирован в $BIN"
         return 0
     fi
 
-    # Вариант В: ничего нет
-    echo
-    echo -e "${B_RED}╔══════════════════════════════════════════════════════════╗${NC}" >&2
-    echo -e "${B_RED}║  ✗ ОШИБКА: основной скрипт antiscanner не найден          ║${NC}" >&2
-    echo -e "${B_RED}╚══════════════════════════════════════════════════════════╝${NC}" >&2
-    echo >&2
-    echo -e "${B_YELLOW}Проверены пути:${NC}" >&2
-    echo -e "  • $BIN" >&2
-    for c in "${candidates[@]}"; do echo -e "  • $c" >&2; done
-    echo >&2
-    echo -e "${B_WHITE}Как исправить:${NC}" >&2
-    echo -e "  ${B_GREEN}1)${NC} ${DIM}cp antiscanner $INSTALLER_DIR/ && sudo bash $0${NC}" >&2
-    echo -e "  ${B_GREEN}2)${NC} ${DIM}sudo cp antiscanner $BIN && sudo chmod +x $BIN${NC}" >&2
-    exit 1
+    echo -e "${B_RED}✗ Основной скрипт antiscanner не найден!${NC}"
+    echo -e "Поместите файл рядом с установщиком и попробуйте снова."
+    return 1
 }
 
-# =============== Пре-реквизиты ===============
-check_prerequisites() {
-    step "Проверка пререквизитов"
-
-    [ "$EUID" -ne 0 ] && die "Нужны root. Запустите: sudo bash $0"
-    ok "Root права OK"
-
-    if ! command -v apt-get >/dev/null 2>&1; then
-        die "apt-get не найден — только для Debian/Ubuntu"
-    fi
-    ok "Пакетный менеджер apt-get найден"
-
-    if check_internet; then
-        ok "Интернет доступен"
-    else
-        die "Нет подключения к интернету"
-    fi
-
-    info "Директория установщика: $INSTALLER_DIR"
-    info "Текущая директория: $PWD_DIR"
-}
-
-# =============== Детект существующей установки ===============
 detect_existing_install() {
     local found=()
-    [ -f "$BIN_REPORT_OLD" ]         && found+=("$BIN_REPORT_OLD")
-    [ -d "$CONF_DIR" ]               && found+=("$CONF_DIR/ ($(ls -1 "$CONF_DIR" 2>/dev/null | wc -l) файлов)")
-    [ -f "$RSYSLOG_CONF" ]           && found+=("$RSYSLOG_CONF")
-    [ -f "$LOGROTATE_CONF" ]         && found+=("$LOGROTATE_CONF")
-    [ -f "$LOGROTATE_CONF_OLD" ]     && found+=("$LOGROTATE_CONF_OLD")
+    [ -f "$BIN" ] && found+=("$BIN (v$(get_installed_version))") || true
+    [ -d "$CONF_DIR" ] && found+=("$CONF_DIR ($(ls -1 "$CONF_DIR" 2>/dev/null | wc -l) файлов)") || true
+    [ -f "$RSYSLOG_CONF" ] && found+=("$RSYSLOG_CONF") || true
+    [ -f "$LOGROTATE_CONF" ] && found+=("$LOGROTATE_CONF") || true
 
     for unit in antiscanner-update.service antiscanner-fail2ban.service \
-                antiscanner-honeypot.service antiscanner-unban.service \
-                antiscanner-unban.timer; do
-        [ -f "$SD_DIR/$unit" ] && found+=("systemd: $unit")
+                antiscanner-honeypot.service antiscanner-unban.timer; do
+        [ -f "$SD_DIR/$unit" ] && found+=("systemd: $unit") || true
     done
 
-    local cron_content=""
-    cron_content=$(crontab -l 2>/dev/null || true)
-    if [ -n "$cron_content" ] && echo "$cron_content" | grep -q 'antiscanner'; then
-        local n; n=$(echo "$cron_content" | grep -c 'antiscanner' || true)
+    if crontab -l 2>/dev/null | grep -q 'antiscanner'; then
+        local n; n=$(crontab -l 2>/dev/null | grep -c 'antiscanner' || true)
         found+=("cron: ${n:-0} задач")
     fi
 
     if command -v ipset >/dev/null 2>&1; then
-        ipset list "$IPSET_F2B" &>/dev/null && found+=("ipset: $IPSET_F2B")
-        ipset list "$IPSET_HP"  &>/dev/null && found+=("ipset: $IPSET_HP")
+        local f2b_cnt hp_cnt
+        f2b_cnt=$(ipset_count "$IPSET_F2B")
+        hp_cnt=$(ipset_count "$IPSET_HP")
+        ipset list "$IPSET_F2B" &>/dev/null && found+=("ipset: $IPSET_F2B (забанено: $f2b_cnt)") || true
+        ipset list "$IPSET_HP" &>/dev/null && found+=("ipset: $IPSET_HP (забанено: $hp_cnt)") || true
     fi
 
     if iptables -L "$IPT_CHAIN" -n &>/dev/null; then
-        local cnt=""
-        cnt=$(iptables -S "$IPT_CHAIN" 2>/dev/null | grep -c '^-A' || true)
-        found+=("iptables chain $IPT_CHAIN (${cnt:-0} правил)")
+        local cnt; cnt=$(iptables -S "$IPT_CHAIN" 2>/dev/null | grep -c '^-A .* -j DROP' || echo 0)
+        found+=("iptables: $IPT_CHAIN ($cnt правил)")
     fi
 
-    local rl_check=""
-    rl_check=$(iptables-save 2>/dev/null | grep 'AntiScanner-RateLimit' || true)
-    [ -n "$rl_check" ] && found+=("iptables: rate-limit правила")
+    if iptables-save 2>/dev/null | grep -q 'AntiScanner-RateLimit'; then
+        found+=("iptables: rate-limit правила")
+    fi
 
-    if command -v ufw >/dev/null 2>&1; then
-        local ufw_check=""
-        ufw_check=$(ufw status numbered 2>/dev/null | grep 'AntiScanner-Block' || true)
-        if [ -n "$ufw_check" ]; then
-            local ufw_cnt; ufw_cnt=$(echo "$ufw_check" | wc -l || echo 0)
-            found+=("UFW: ${ufw_cnt:-0} правил")
-        fi
+    if command -v ufw >/dev/null 2>&1 && ufw status numbered 2>/dev/null | grep -q 'AntiScanner'; then
+        found+=("UFW правила")
     fi
 
     local logs=(/var/log/antiscanner_*.log)
-    [ -e "${logs[0]}" ] && found+=("логи: ${#logs[@]} файлов")
+    [ -e "${logs[0]}" ] && found+=("логи antiscanner") || true
 
     EXISTING_ARTIFACTS=("${found[@]}")
 }
 
-# =============== Полная очистка ===============
 purge_existing() {
-    step "Полная очистка предыдущей установки"
+    step "Очистка предыдущей установки"
 
-    # 1. Systemd
     for s in antiscanner-fail2ban antiscanner-honeypot antiscanner-update \
              antiscanner-unban.service antiscanner-unban.timer; do
-        if systemctl list-unit-files 2>/dev/null | grep -q "^$s"; then
-            systemctl disable --now "$s" 2>/dev/null || true
-        fi
+        systemctl disable --now "$s" 2>/dev/null || true
     done
-    rm -f "$SD_DIR"/antiscanner-*.service "$SD_DIR"/antiscanner-*.timer
-    systemctl daemon-reload
-    ok "Systemd юниты удалены"
+    rm -f "$SD_DIR"/antiscanner-*.service "$SD_DIR"/antiscanner-*.timer 2>/dev/null || true
+    systemctl daemon-reload || true
 
-    # 2. ipset (сначала убрать iptables-ссылки)
     iptables -D INPUT -m set --match-set "$IPSET_F2B" src -j DROP 2>/dev/null || true
-    iptables -D INPUT -m set --match-set "$IPSET_HP"  src -j DROP 2>/dev/null || true
+    iptables -D INPUT -m set --match-set "$IPSET_HP" src -j DROP 2>/dev/null || true
     ipset destroy "$IPSET_F2B" 2>/dev/null || true
-    ipset destroy "$IPSET_HP"  2>/dev/null || true
-    ok "ipsets удалены"
+    ipset destroy "$IPSET_HP" 2>/dev/null || true
 
-    # 3. Rate-limit (через переменную, защита от pipefail)
     if command -v iptables-save >/dev/null 2>&1; then
         local rl_rules=""
         rl_rules=$(iptables-save 2>/dev/null | grep 'AntiScanner-RateLimit' || true)
         if [ -n "$rl_rules" ]; then
-            local rl_count=0
-            while IFS= read -r rule; do
-                [ -z "$rule" ] && continue
-                local del_rule; del_rule=$(echo "$rule" | sed 's/^-A /-D /' || true)
-                if [ -n "$del_rule" ] && eval "iptables $del_rule" 2>/dev/null; then
-                    rl_count=$((rl_count+1))
-                fi
-            done <<< "$rl_rules"
-            [ "$rl_count" -gt 0 ] && ok "Rate-limit: удалено $rl_count правил"
+            echo "$rl_rules" | sed 's/^-A /-D /' | while read -r rule; do
+                eval "iptables $rule" 2>/dev/null || true
+            done
         fi
     fi
 
-    # 4. iptables chains
     for c in iptables ip6tables; do
         $c -D INPUT -j "$IPT_CHAIN" 2>/dev/null || true
         $c -F "$IPT_CHAIN" 2>/dev/null || true
         $c -X "$IPT_CHAIN" 2>/dev/null || true
     done
-    ok "iptables цепочки удалены"
 
-    [ -d /etc/iptables ] && {
-        iptables-save  > /etc/iptables/rules.v4 2>/dev/null || true
-        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-    }
-
-    # 5. UFW (через переменную)
     if command -v ufw >/dev/null 2>&1; then
         local ufw_lines=""
-        ufw_lines=$(ufw status numbered 2>/dev/null | grep 'AntiScanner' | tac || true)
+        ufw_lines=$(ufw status numbered 2>/dev/null | grep 'AntiScanner' || true)
         if [ -n "$ufw_lines" ]; then
-            local removed=0 num line
+            local num
             while IFS= read -r line; do
-                [ -z "$line" ] && continue
-                num=$(echo "$line" | grep -oE '^$$\s*[0-9]+$$' | tr -d '[] ' || true)
-                if [ -n "$num" ] && ufw --force delete "$num" >/dev/null 2>&1; then
-                    removed=$((removed+1))
-                fi
+                num=$(echo "$line" | grep -oE '^$$\s*[0-9]+$$' | tr -d '[] ' 2>/dev/null || true)
+                [ -n "$num" ] && ufw --force delete "$num" >/dev/null 2>&1 || true
             done <<< "$ufw_lines"
-            [ "$removed" -gt 0 ] && ok "UFW: удалено $removed правил"
             ufw reload >/dev/null 2>&1 || true
         fi
     fi
 
-    # 6. CRON (через переменную)
-    local old_cron=""
-    old_cron=$(crontab -l 2>/dev/null || true)
-    if [ -n "$old_cron" ]; then
-        local new_cron=""
-        new_cron=$(echo "$old_cron" | grep -vF 'antiscanner' || true)
-        if [ -n "$new_cron" ]; then
-            echo "$new_cron" | crontab - 2>/dev/null || true
-        else
-            crontab -r 2>/dev/null || true
-        fi
-    fi
-    ok "CRON очищен"
-
-    # 7. Файлы
-    rm -f "$RSYSLOG_CONF"
+    (crontab -l 2>/dev/null | grep -vF 'antiscanner' || true) | crontab - 2>/dev/null || true
+    rm -f "$RSYSLOG_CONF" "$LOGROTATE_CONF" "$LOGROTATE_CONF_OLD" 2>/dev/null || true
     systemctl restart rsyslog 2>/dev/null || true
-    rm -f "$LOGROTATE_CONF" "$LOGROTATE_CONF_OLD"
-    rm -rf "$CONF_DIR"
-    rm -f /var/log/antiscanner_*.log "$BIN_REPORT_OLD"
-    ok "Конфиги и логи удалены"
-    info "Основной скрипт $BIN сохранён"
-}
+    rm -rf "$CONF_DIR" 2>/dev/null || true
+    rm -f /var/log/antiscanner_*.log "$BIN_REPORT_OLD" 2>/dev/null || true
 
-handle_existing() {
-    detect_existing_install
-    if [ "${#EXISTING_ARTIFACTS[@]}" -eq 0 ]; then
-        ok "Предыдущая установка не обнаружена"
-        return 0
-    fi
-
-    echo
-    echo -e "${B_YELLOW}⚠ Обнаружены признаки предыдущей установки:${NC}"
-    local i
-    for i in "${EXISTING_ARTIFACTS[@]}"; do
-        echo -e "  ${B_YELLOW}•${NC} $i"
-    done
-    echo
-    echo -e "${B_WHITE}Варианты:${NC}"
-    echo -e "  ${B_GREEN}1)${NC} Удалить всё и переустановить с нуля ${B_CYAN}(рекомендуется)${NC}"
-    echo -e "  ${B_YELLOW}2)${NC} Продолжить поверх"
-    echo -e "  ${B_RED}3)${NC} Отмена"
-    echo
-    read -rp "Ваш выбор [1/2/3]: " choice
-
-    case "$choice" in
-        1)
-            read -rp "$(echo -e ${B_RED}Подтвердите [yes]:${NC} )" confirm
-            [ "$confirm" != "yes" ] && { echo "Отмена"; exit 0; }
-            if [ -d "$CONF_DIR" ]; then
-                local backup="/root/antiscanner-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-                if tar czf "$backup" -C / "etc/antiscanner" 2>/dev/null; then
-                    ok "Бэкап: $backup"
-                else
-                    warn "Бэкап не создан"
-                fi
-            fi
-            purge_existing
-            ;;
-        2) warn "Продолжаем поверх" ;;
-        *) echo "Отмена"; exit 0 ;;
-    esac
+    ok "Предыдущая установка очищена"
 }
 
 detect_firewall_mode() {
@@ -394,176 +314,85 @@ detect_firewall_mode() {
     info "Режим фаервола: ${B_MAGENTA}$MODE${NC}"
 }
 
-# =============== Установка зависимостей ===============
 install_dependencies() {
-    step "Установка зависимостей (Ubuntu 24.04)"
-
+    step "Установка зависимостей"
     export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
 
-    if ! apt-get update -qq 2>&1 | tail -5; then
-        warn "apt-get update дал предупреждения"
-    fi
-
-    local base_pkgs="curl python3 rsyslog ipset netcat-traditional iputils-ping cron hostname"
-    local fw_pkgs=""
-
+    local pkgs="curl python3 rsyslog ipset netcat-traditional iputils-ping cron"
     if [ "$MODE" = "iptables" ]; then
         echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
         echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-        fw_pkgs="iptables iptables-persistent"
-    else
-        if dpkg -l 2>/dev/null | grep -q iptables-persistent; then
-            apt-get purge -y -qq iptables-persistent >/dev/null 2>&1 || true
-            info "iptables-persistent удалён (конфликт с UFW)"
-        fi
+        pkgs="$pkgs iptables iptables-persistent"
     fi
-
-    if ! apt-get install -y -qq $base_pkgs $fw_pkgs 2>&1 | tail -10; then
-        die "Не удалось установить пакеты"
-    fi
-
-    # Переключаем nc на traditional (НЕ удаляя openbsd — может быть зависимостью)
-    if [ -x /bin/nc.traditional ] && command -v update-alternatives >/dev/null 2>&1; then
-        if update-alternatives --set nc /bin/nc.traditional >/dev/null 2>&1; then
-            ok "nc → /bin/nc.traditional"
-        else
-            update-alternatives --install /usr/bin/nc nc /bin/nc.traditional 60 >/dev/null 2>&1 || true
-            update-alternatives --set nc /bin/nc.traditional >/dev/null 2>&1 || warn "Не смог переключить alternative"
-        fi
-    fi
-
-    for pkg in curl python3 ipset iptables ss; do
-        if ! command -v "$pkg" >/dev/null 2>&1; then
-            die "Команда '$pkg' не найдена после установки"
-        fi
-    done
-    ok "Базовые пакеты установлены"
-
-    if [ -x /bin/nc.traditional ]; then
-        ok "netcat-traditional: /bin/nc.traditional"
-    else
-        die "netcat-traditional не установился — honeypot работать не будет"
-    fi
-
-    systemctl enable --now cron >/dev/null 2>&1 || warn "cron не стартанул"
-
-    if [ "$MODE" = "iptables" ]; then
-        ok "iptables-persistent установлен"
-    fi
+    apt-get install -y -qq $pkgs
+    ok "Зависимости установлены"
 }
 
 create_config() {
-    step "Создание конфига"
+    step "Создание конфигурации"
     mkdir -p "$CONF_DIR"
     chmod 755 "$CONF_DIR"
 
-    for f in whitelist.txt current.list previous.list watch.state \
-             alerts.seen fail2ban.state fail2ban.bans geoip.cache \
-             protected.list last.diff; do
+    for f in whitelist.txt current.list previous.list watch.state alerts.seen \
+             fail2ban.state fail2ban.bans geoip.cache protected.list last.diff; do
         touch "$CONF_DIR/$f"
     done
 
     if [ ! -f "$CONFIG" ]; then
-        cat > "$CONFIG" << 'CFG'
-# === AntiScanner v3.3.3 Configuration (Ubuntu 24.04) ===
-
-# --- Real-time alerts (watch) ---
+        cat > "$CONFIG" << CFG
+# === AntiScanner v${AS_VERSION} Configuration ===
 ALERT_THRESHOLD=3
 ALERT_WINDOW=300
 ALERT_COOLDOWN=3600
-
-# --- Fail2ban ---
 F2B_MAX_FAILS=3
 F2B_WINDOW=600
 F2B_BAN_SECONDS=86400
-
-# --- Honeypot ---
 HONEYPOT_PORTS="23 2222 3389 8080"
-
-# --- Rate limiting ---
+HONEYPOT_COOLDOWN=25
 RATELIMIT_ENABLED=true
 RATELIMIT_PORTS="22"
 RATELIMIT_RATE="10/min"
 RATELIMIT_BURST=15
-
-# --- Флаги уведомлений (true/false) ---
 NOTIFY_ALERTS=true
 NOTIFY_REPORT=true
 NOTIFY_HONEYPOT=false
 NOTIFY_FAIL2BAN=false
-
-# --- Блоклист ---
 BLOCKLIST_URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
-
-# --- Telegram (IPv4 для обхода DPI) ---
 TG_API_IPV4="149.154.167.220"
 CFG
         chmod 640 "$CONFIG"
-        ok "Создан $CONFIG"
+        ok "Создан конфиг $CONFIG"
     else
-        info "Конфиг уже существует"
-        local migrated=0
-        for pair in "NOTIFY_ALERTS=true" "NOTIFY_REPORT=true" \
-                    "NOTIFY_HONEYPOT=false" "NOTIFY_FAIL2BAN=false"; do
-            local key="${pair%%=*}"
-            if ! grep -q "^${key}=" "$CONFIG" 2>/dev/null; then
-                echo "$pair" >> "$CONFIG"
-                migrated=1
-            fi
-        done
-        [ "$migrated" = "1" ] && ok "Миграция: добавлены NOTIFY_* флаги"
+        if ! grep -q 'HONEYPOT_COOLDOWN' "$CONFIG"; then
+            echo 'HONEYPOT_COOLDOWN=25' >> "$CONFIG"
+            ok "Добавлен HONEYPOT_COOLDOWN в существующий конфиг"
+        fi
+        ok "Конфиг сохранён"
     fi
 
     for f in update blocked alerts fail2ban honeypot; do
         touch "/var/log/antiscanner_${f}.log"
         chmod 644 "/var/log/antiscanner_${f}.log"
     done
-    ok "Лог-файлы созданы"
+    ok "Логи созданы"
 }
 
 setup_rsyslog() {
-    step "Настройка rsyslog (RainerScript)"
+    step "Настройка rsyslog"
     cat > "$RSYSLOG_CONF" << 'RS'
-if ($msg contains "HONEYPOT-HIT") then {
-    action(type="omfile" file="/var/log/antiscanner_honeypot.log")
-    stop
-}
-if ($msg contains "ANTISCANNER-BLOCK") then {
-    action(type="omfile" file="/var/log/antiscanner_blocked.log")
-    stop
-}
-if ($msg contains "[UFW BLOCK]") then {
-    action(type="omfile" file="/var/log/antiscanner_blocked.log")
-}
+if ($msg contains "HONEYPOT-HIT") then { action(type="omfile" file="/var/log/antiscanner_honeypot.log") stop }
+if ($msg contains "ANTISCANNER-BLOCK") then { action(type="omfile" file="/var/log/antiscanner_blocked.log") stop }
+if ($msg contains "[UFW BLOCK]") then { action(type="omfile" file="/var/log/antiscanner_blocked.log") }
 RS
-
-    local rsyslog_check=""
-    rsyslog_check=$(rsyslogd -N1 2>&1 || true)
-    if echo "$rsyslog_check" | grep -qi 'error\|invalid'; then
-        warn "rsyslog config имеет предупреждения"
-    fi
-    systemctl restart rsyslog || warn "rsyslog не перезапустился"
+    systemctl restart rsyslog 2>/dev/null || true
     ok "rsyslog настроен"
-
-    logger -t antiscanner "HONEYPOT-HIT: SRC=0.0.0.0 DPT=0 (install test)" 2>/dev/null || true
-    sleep 1
-    if grep -q "install test" /var/log/antiscanner_honeypot.log 2>/dev/null; then
-        ok "Запись через rsyslog работает"
-        sed -i '/install test/d' /var/log/antiscanner_honeypot.log 2>/dev/null || true
-    else
-        info "rsyslog не записал — honeypot будет писать напрямую (это OK)"
-    fi
 }
 
 setup_logrotate() {
     step "Настройка logrotate"
     cat > "$LOGROTATE_CONF" << 'LR'
-/var/log/antiscanner_update.log
-/var/log/antiscanner_blocked.log
-/var/log/antiscanner_alerts.log
-/var/log/antiscanner_fail2ban.log
-/var/log/antiscanner_honeypot.log
-{
+/var/log/antiscanner_*.log {
     weekly
     rotate 4
     compress
@@ -583,10 +412,9 @@ setup_systemd() {
     step "Создание systemd сервисов"
     cat > "$SD_DIR/antiscanner-fail2ban.service" << 'SD'
 [Unit]
-Description=AntiScanner Fail2ban watcher (SSH)
-After=network-online.target rsyslog.service ssh.service
+Description=AntiScanner Fail2ban watcher
+After=network-online.target rsyslog.service
 Wants=network-online.target
-
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/antiscanner fail2ban run
@@ -594,7 +422,6 @@ Restart=always
 RestartSec=10
 StandardOutput=append:/var/log/antiscanner_fail2ban.log
 StandardError=append:/var/log/antiscanner_fail2ban.log
-
 [Install]
 WantedBy=multi-user.target
 SD
@@ -604,36 +431,31 @@ SD
 Description=AntiScanner Honeypot listener
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/antiscanner honeypot run
 Restart=always
 RestartSec=5
-
 [Install]
 WantedBy=multi-user.target
 SD
 
     cat > "$SD_DIR/antiscanner-update.service" << 'SD'
 [Unit]
-Description=AntiScanner blocklist update on boot
+Description=AntiScanner blocklist update
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/antiscanner update
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 SD
 
     cat > "$SD_DIR/antiscanner-unban.service" << 'SD'
 [Unit]
-Description=AntiScanner auto-unban expired IPs
-
+Description=AntiScanner auto-unban
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/antiscanner fail2ban unban-expired
@@ -642,155 +464,121 @@ SD
     cat > "$SD_DIR/antiscanner-unban.timer" << 'SD'
 [Unit]
 Description=AntiScanner unban timer
-
 [Timer]
 OnCalendar=*:0/10
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 SD
 
     systemctl daemon-reload
-    ok "Systemd юниты созданы"
+    ok "Systemd сервисы созданы"
 }
 
-# =============== CRON (через переменные) ===============
 setup_cron() {
     step "Настройка CRON"
-
-    local cron_lines="20 3 * * * /usr/local/bin/antiscanner update >> /var/log/antiscanner_update.log 2>&1
+    local lines="20 3 * * * /usr/local/bin/antiscanner update >> /var/log/antiscanner_update.log 2>&1
 0 9 * * * /usr/local/bin/antiscanner report >> /var/log/antiscanner_update.log 2>&1
 */5 * * * * /usr/local/bin/antiscanner watch >> /var/log/antiscanner_alerts.log 2>&1"
-
-    local current_cron=""
-    current_cron=$(crontab -l 2>/dev/null || true)
-
-    local filtered_cron=""
-    if [ -n "$current_cron" ]; then
-        filtered_cron=$(echo "$current_cron" | grep -vF 'antiscanner' || true)
-    fi
-
-    if [ -n "$filtered_cron" ]; then
-        printf '%s\n%s\n' "$filtered_cron" "$cron_lines" | crontab -
-    else
-        echo "$cron_lines" | crontab -
-    fi
-
-    ok "CRON: 03:20 update, 09:00 report, */5мин watch"
+    (crontab -l 2>/dev/null | grep -vF 'antiscanner' || true; echo "$lines") | crontab -
+    ok "CRON настроен"
 }
 
-fix_hostname() {
-    step "Проверка /etc/hosts"
-    if ! grep -q "$(hostname)" /etc/hosts 2>/dev/null; then
-        echo "127.0.1.1 $(hostname)" >> /etc/hosts
-        ok "Добавлена запись в /etc/hosts"
+first_blocklist_run() {
+    step "Первичная загрузка блоклиста"
+    info "Скачивание и применение правил..."
+    if "$BIN" update; then
+        ok "Блоклист загружен и применён"
     else
-        info "hostname уже в /etc/hosts"
+        warn "Не удалось загрузить блоклист"
+        warn "Запустите вручную: sudo antiscanner update"
     fi
 }
 
-interactive_setup() {
+activate_services() {
+    step "Активация сервисов"
+
+    if systemctl enable antiscanner-update.service 2>/dev/null; then
+        ok "antiscanner-update.service: включён для автозапуска"
+    fi
+
+    if systemctl enable --now antiscanner-unban.timer 2>/dev/null; then
+        ok "antiscanner-unban.timer: запущен"
+    fi
+
+    echo
+    read -rp "Включить Fail2ban (защита от brute-force SSH)? [Y/n]: " a
+    if [[ ! "$a" =~ ^[Nn]$ ]]; then
+        if systemctl enable --now antiscanner-fail2ban.service 2>/dev/null; then
+            ok "Fail2ban запущен"
+        else
+            warn "Не удалось запустить Fail2ban"
+        fi
+    else
+        info "Fail2ban пропущен (включить позже: antiscanner fail2ban enable)"
+    fi
+
+    read -rp "Включить Honeypot (ловушка на портах 23 2222 3389 8080)? [Y/n]: " a
+    if [[ ! "$a" =~ ^[Nn]$ ]]; then
+        "$BIN" honeypot setup >/dev/null 2>&1 || true
+        if systemctl enable --now antiscanner-honeypot.service 2>/dev/null; then
+            ok "Honeypot запущен"
+        else
+            warn "Не удалось запустить Honeypot"
+        fi
+    else
+        info "Honeypot пропущен (включить позже: antiscanner honeypot enable)"
+    fi
+
+    read -rp "Включить Rate-limit на SSH (10 запросов/мин)? [Y/n]: " a
+    if [[ ! "$a" =~ ^[Nn]$ ]]; then
+        if "$BIN" ratelimit setup >/dev/null 2>&1; then
+            ok "Rate-limit настроен"
+        else
+            warn "Не удалось настроить rate-limit"
+        fi
+    else
+        info "Rate-limit пропущен"
+    fi
+}
+
+interactive_telegram() {
     step "Настройка Telegram (опционально)"
     if [ ! -f "$CONF_DIR/telegram.conf" ]; then
-        read -rp "Настроить Telegram уведомления? [Y/n]: " tg
-        if [[ ! "$tg" =~ ^[Nn]$ ]]; then
-            "$BIN" telegram setup || warn "Настройка пропущена"
+        read -rp "Настроить Telegram уведомления сейчас? [y/N]: " tg
+        if [[ "$tg" =~ ^[Yy]$ ]]; then
+            "$BIN" telegram setup || warn "Настройка Telegram пропущена"
+        else
+            info "Пропущено (настроить позже: antiscanner telegram setup)"
         fi
     else
         ok "Telegram уже настроен"
     fi
+}
 
-    step "Активация модулей защиты"
+# =============== ПОЛНАЯ УСТАНОВКА ===============
+do_install() {
+    check_internet
+    ensure_main_script || return 1
 
-    read -rp "Honeypot (порты ${HONEYPOT_PORTS:-23 2222 3389 8080})? [Y/n]: " hp
-    if [[ ! "$hp" =~ ^[Nn]$ ]]; then
-        "$BIN" honeypot setup >/dev/null 2>&1 || true
-        systemctl enable --now antiscanner-honeypot.service 2>/dev/null || warn "Honeypot не запустился"
-        ok "Honeypot включён"
-    fi
-
-    read -rp "Rate-limit на SSH (22, 10/мин)? [Y/n]: " rl
-    if [[ ! "$rl" =~ ^[Nn]$ ]]; then
-        "$BIN" ratelimit setup >/dev/null 2>&1 || warn "Rate-limit не настроен"
-        ok "Rate-limit включён"
-    fi
-
-    read -rp "Fail2ban (3 fail / 10мин)? [Y/n]: " f2b
-    if [[ ! "$f2b" =~ ^[Nn]$ ]]; then
-        systemctl enable --now antiscanner-fail2ban.service 2>/dev/null || warn "Fail2ban не запустился"
-        ok "Fail2ban включён"
-    fi
-
-    read -rp "Авто-обновление блоклиста при загрузке? [Y/n]: " aup
-    if [[ ! "$aup" =~ ^[Nn]$ ]]; then
-        systemctl enable antiscanner-update.service 2>/dev/null || warn "Auto-update не активирован"
-        ok "Auto-update включён"
-    fi
-
-    systemctl enable --now antiscanner-unban.timer 2>/dev/null || true
-    ok "Auto-unban таймер активирован"
-
-    if [ -f "$CONF_DIR/telegram.conf" ]; then
-        step "Шумность уведомлений в Telegram"
-        info "По умолчанию: alerts/report — вкл; honeypot/fail2ban — молчат"
+    detect_existing_install
+    if [ "${#EXISTING_ARTIFACTS[@]}" -gt 0 ]; then
         echo
-        read -rp "Слать КАЖДОЕ попадание в Honeypot в TG? [y/N]: " nhp
-        if [[ "$nhp" =~ ^[Yy]$ ]]; then
-            sed -i 's/^NOTIFY_HONEYPOT=.*/NOTIFY_HONEYPOT=true/' "$CONFIG"
-            ok "NOTIFY_HONEYPOT=true"
-        else
-            info "Honeypot молчит. Включить: antiscanner honeypot verbose"
+        echo -e "${B_YELLOW}Обнаружена предыдущая установка:${NC}"
+        for i in "${EXISTING_ARTIFACTS[@]}"; do
+            echo -e "  ${B_YELLOW}•${NC} $i"
+        done
+        echo
+        read -rp "Очистить и установить заново? [y/N]: " a
+        if [[ ! "$a" =~ ^[Yy]$ ]]; then
+            echo "Отмена."
+            return 1
         fi
-
-        read -rp "Слать КАЖДЫЙ бан Fail2ban в TG? [y/N]: " nf2b
-        if [[ "$nf2b" =~ ^[Yy]$ ]]; then
-            sed -i 's/^NOTIFY_FAIL2BAN=.*/NOTIFY_FAIL2BAN=true/' "$CONFIG"
-            ok "NOTIFY_FAIL2BAN=true"
-        else
-            info "Fail2ban молчит. Включить: antiscanner fail2ban verbose"
-        fi
+        purge_existing
+        ensure_main_script || return 1
     fi
-}
 
-first_run() {
-    step "Первичная загрузка блоклиста"
-    if "$BIN" update; then
-        ok "Блоклист загружен"
-    else
-        warn "Первичная загрузка не удалась — запустите 'antiscanner update' вручную"
-    fi
-}
-
-final_check() {
-    step "Самодиагностика"
-    "$BIN" test || warn "В тесте есть предупреждения"
-    echo
-    "$BIN" status || true
-}
-
-main() {
-    clear
-    cat << 'BANNER'
-
-  ┌─────────────────────────────────────────────────────────┐
-  │   ╔═╗┌┐┌┌┬┐┬╔═╗┌─┐┌─┐┌┐┌┌┐┌┌─┐┬─┐                      │
-  │   ╠═╣│││ │ │╚═╗│  ├─┤│││││││├┤ ├┬┘                     │
-  │   ╩ ╩┘└┘ ┴ ┴╚═╝└─┘┴ ┴┘└┘┘└┘└─┘┴└─  v3.3.3               │
-  │                                                         │
-  │   Для Ubuntu 24.04 LTS                                  │
-  │   blocklist + fail2ban + honeypot + ratelimit +         │
-  │   geoip + telegram + notify-flags                       │
-  └─────────────────────────────────────────────────────────┘
-
-BANNER
-
-    check_ubuntu_24
-    check_prerequisites
-    ensure_main_script
-    handle_existing
     detect_firewall_mode
-    fix_hostname
     install_dependencies
     create_config
     setup_rsyslog
@@ -798,38 +586,237 @@ BANNER
     setup_systemd
     setup_cron
 
-    HONEYPOT_PORTS=$(grep '^HONEYPOT_PORTS=' "$CONFIG" 2>/dev/null | cut -d'"' -f2 || echo "23 2222 3389 8080")
+    first_blocklist_run
+    activate_services
+    interactive_telegram
 
-    interactive_setup
-    first_run
-    final_check
+    step "Финальная диагностика"
+    "$BIN" test || true
+    echo
+    "$BIN" status || true
 
     echo
     echo -e "${B_GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${B_GREEN}║         ✔ УСТАНОВКА ЗАВЕРШЕНА (v3.3.3 / Ubuntu 24)        ║${NC}"
+    echo -e "${B_GREEN}║          Установка AntiScanner v${AS_VERSION} завершена          ║${NC}"
     echo -e "${B_GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
+}
+
+# =============== ОБНОВЛЕНИЕ ОСНОВНОГО СКРИПТА ===============
+do_update_main() {
+    step "Обновление основного скрипта antiscanner"
+
+    local candidates=(
+        "$PWD_DIR/antiscanner"
+        "$PWD_DIR/antiscanner.sh"
+        "$INSTALLER_DIR/antiscanner"
+        "$INSTALLER_DIR/antiscanner.sh"
+    )
+
+    local src=""
+    for c in "${candidates[@]}"; do
+        if [ -f "$c" ] && [ "$c" != "$BIN" ]; then
+            src="$c"
+            break
+        fi
+    done
+
+    if [ -z "$src" ]; then
+        echo -e "${B_RED}Файл antiscanner не найден рядом с установщиком${NC}"
+        return 1
+    fi
+
+    local old_ver new_ver
+    old_ver=$(get_installed_version)
+    new_ver=$(grep -oP 'antiscanner v\K[0-9]+\.[0-9]+\.[0-9]+' "$src" 2>/dev/null | head -1 || echo "?")
+
+    info "Источник: $src"
+    info "Текущая версия:    v$old_ver"
+    info "Новая версия:      v$new_ver"
+
+    cp "$src" "$BIN"
+    chmod +x "$BIN"
+    ok "Основной скрипт обновлён до v$new_ver"
+
+    if [ -f "$CONFIG" ] && ! grep -q 'HONEYPOT_COOLDOWN' "$CONFIG"; then
+        echo 'HONEYPOT_COOLDOWN=25' >> "$CONFIG"
+        ok "Добавлен HONEYPOT_COOLDOWN в конфиг"
+    fi
+
     echo
-    echo -e "${B_WHITE}Команды:${NC}"
-    echo -e "  ${B_MAGENTA}antiscanner status${NC}              — статус"
-    echo -e "  ${B_MAGENTA}antiscanner report --24h${NC}        — отчёт за сутки"
-    echo -e "  ${B_MAGENTA}antiscanner honeypot list${NC}       — пойманные honeypot"
-    echo -e "  ${B_MAGENTA}antiscanner fail2ban list${NC}       — забаненные f2b"
-    echo -e "  ${B_MAGENTA}antiscanner test${NC}                — самодиагностика"
+    "$BIN" test || true
+}
+
+show_quick_stats() {
+    if [ ! -f "$BIN" ]; then
+        echo -e "${B_RED}AntiScanner не установлен${NC}"
+        return
+    fi
+
+    local f2b_cnt hp_cnt
+    f2b_cnt=$(ipset_count "$IPSET_F2B")
+    hp_cnt=$(ipset_count "$IPSET_HP")
+
     echo
-    echo -e "${B_WHITE}Управление:${NC}"
-    echo -e "  ${B_MAGENTA}antiscanner notify status${NC}              — шум/тишина"
-    echo -e "  ${B_MAGENTA}antiscanner honeypot silent|verbose${NC}"
-    echo -e "  ${B_MAGENTA}antiscanner fail2ban silent|verbose${NC}"
-    echo -e "  ${B_MAGENTA}antiscanner honeypot enable|disable${NC}"
-    echo -e "  ${B_MAGENTA}antiscanner fail2ban enable|disable${NC}"
+    echo -e "${B_CYAN}═══ Быстрая статистика ═══${NC}"
+    echo -e "  Версия:               ${B_GREEN}$(get_installed_version)${NC}"
+    echo -e "  Fail2ban забанено:    ${B_YELLOW}${f2b_cnt}${NC}"
+    echo -e "  Honeypot забанено:    ${B_YELLOW}${hp_cnt}${NC}"
+
+    if iptables -L "$IPT_CHAIN" -n &>/dev/null; then
+        local rules; rules=$(iptables -S "$IPT_CHAIN" 2>/dev/null | grep -c '^-A .* -j DROP' || echo 0)
+        echo -e "  Блоклист правил:      ${B_YELLOW}${rules}${NC}"
+    fi
+
+    if [ -f /var/log/antiscanner_blocked.log ]; then
+        local today_blocked; today_blocked=$(grep -c "$(date '+%b %e')" /var/log/antiscanner_blocked.log 2>/dev/null || echo 0)
+        echo -e "  Атак сегодня:         ${B_YELLOW}${today_blocked}${NC}"
+    fi
+
     echo
-    echo -e "  ${B_MAGENTA}antiscanner help${NC}                — всё"
+}
+
+# =============== МЕНЮ ===============
+show_main_menu() {
     echo
-    echo -e "${B_WHITE}Конфиг:${NC}     ${DIM}$CONFIG${NC}"
-    echo -e "${B_WHITE}Логи:${NC}       ${DIM}/var/log/antiscanner_*.log${NC}"
+    echo -e "${B_CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${B_CYAN}║${B_WHITE}                ANTISCANNER v${AS_VERSION}                        ${B_CYAN}║${NC}"
+    echo -e "${B_CYAN}║${B_WHITE}              Главное меню действий                       ${B_CYAN}║${NC}"
+    echo -e "${B_CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
+
+    if [ -f "$BIN" ]; then
+        local installed; installed=$(get_installed_version)
+        if [ "$installed" = "$AS_VERSION" ]; then
+            echo -e "  Установлено: ${B_GREEN}v${installed}${NC} (актуальная)"
+        else
+            echo -e "  Установлено: ${B_YELLOW}v${installed}${NC} (доступна v${AS_VERSION})"
+        fi
+    else
+        echo -e "  Установлено: ${B_RED}не установлено${NC}"
+    fi
+
     echo
-    echo -e "${B_CYAN}Удачи! 🛡️${NC}"
+    echo -e "  ${B_GREEN}1)${NC} Установить AntiScanner (полная установка)"
+    echo -e "  ${B_GREEN}2)${NC} Переустановить (удалить старое + установить)"
+    echo -e "  ${B_GREEN}3)${NC} Обновить только основной скрипт"
+    echo -e "  ${B_RED}4)${NC} Полностью удалить AntiScanner"
+    echo -e "  ${B_CYAN}5)${NC} Показать статус"
+    echo -e "  ${B_CYAN}6)${NC} Запустить диагностику"
+    echo -e "  ${B_CYAN}7)${NC} Обновить блоклист сейчас"
+    echo -e "  ${B_CYAN}8)${NC} Быстрая статистика"
+    echo -e "  ${B_YELLOW}0)${NC} Выход"
     echo
+}
+
+run_menu() {
+    while true; do
+        show_main_menu
+        read -rp "Выберите действие [0-8]: " choice
+        echo
+
+        case "$choice" in
+            1)
+                do_install || true
+                read -rp "Нажмите Enter для возврата в меню..."
+                ;;
+            2)
+                detect_existing_install
+                if [ "${#EXISTING_ARTIFACTS[@]}" -gt 0 ]; then
+                    echo -e "${B_YELLOW}Будет удалена предыдущая установка${NC}"
+                    read -rp "Подтвердите [yes]: " c
+                    if [ "$c" = "yes" ]; then
+                        purge_existing
+                        do_install || true
+                    else
+                        echo "Отмена."
+                    fi
+                else
+                    do_install || true
+                fi
+                read -rp "Нажмите Enter для возврата в меню..."
+                ;;
+            3)
+                do_update_main || true
+                read -rp "Нажмите Enter для возврата в меню..."
+                ;;
+            4)
+                full_uninstall || true
+                read -rp "Нажмите Enter для возврата в меню..."
+                ;;
+            5)
+                if [ -f "$BIN" ]; then
+                    "$BIN" status || true
+                else
+                    echo -e "${B_RED}AntiScanner не установлен${NC}"
+                fi
+                read -rp "Нажмите Enter для возврата в меню..."
+                ;;
+            6)
+                if [ -f "$BIN" ]; then
+                    "$BIN" test || true
+                else
+                    echo -e "${B_RED}AntiScanner не установлен${NC}"
+                fi
+                read -rp "Нажмите Enter для возврата в меню..."
+                ;;
+            7)
+                if [ -f "$BIN" ]; then
+                    "$BIN" update || true
+                else
+                    echo -e "${B_RED}AntiScanner не установлен${NC}"
+                fi
+                read -rp "Нажмите Enter для возврата в меню..."
+                ;;
+            8)
+                show_quick_stats
+                read -rp "Нажмите Enter для возврата в меню..."
+                ;;
+            0|q|Q|exit|quit)
+                echo "До свидания!"
+                exit 0
+                ;;
+            *)
+                echo -e "${B_RED}Неверный выбор${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+main() {
+    [ "$EUID" -ne 0 ] && die "Запустите с sudo: sudo bash $0"
+
+    clear
+    cat << BANNER
+  ┌─────────────────────────────────────────────────────────┐
+  │   ╔═╗┌┐┌┌┬┐┬╔═╗┌─┐┌─┐┌┐┌┌┐┌┌─┐┬─┐                       │
+  │   ╠═╣│││ │ │╚═╗│  ├─┤│││││││├┤├┬┘                       │
+  │   ╩ ╩┘└┘ ┴ ┴╚═╝└─┘┴ ┴┘└┘┘└┘└─┘┴└─  v${AS_VERSION}               │
+  │                                                         │
+  │       Установщик с главным меню                         │
+  └─────────────────────────────────────────────────────────┘
+BANNER
+
+    if [[ "${1:-}" == "--uninstall" || "${1:-}" == "uninstall" ]]; then
+        full_uninstall
+        exit 0
+    fi
+    if [[ "${1:-}" == "--install" || "${1:-}" == "install" ]]; then
+        check_ubuntu
+        do_install
+        exit 0
+    fi
+    if [[ "${1:-}" == "--update" || "${1:-}" == "update" ]]; then
+        do_update_main
+        exit 0
+    fi
+    if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+        echo "Installer: v${AS_VERSION}"
+        echo "Installed: v$(get_installed_version)"
+        exit 0
+    fi
+
+    check_ubuntu
+    run_menu
 }
 
 main "$@"
