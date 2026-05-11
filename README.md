@@ -31,10 +31,10 @@
 git clone https://github.com/olegs2026/AntiScan.git
 cd AntiScan
 ```
-
+```
 # Запуск установщика с интерактивным меню
 sudo bash install-antiscanner.sh
-
+```
 
 🎯 Возможности
 Модуль	Описание
@@ -66,11 +66,11 @@ iputils-ping
 📥 Установка
 Способ 1: Через установщик (рекомендуется)
 
-
+```
 git clone https://github.com/olegs2026/AntiScan.git
 cd AntiScan
 sudo bash install-antiscanner.sh
-
+```
 
 Появится главное меню:
 
@@ -89,26 +89,27 @@ sudo bash install-antiscanner.sh
   8) Быстрая статистика
   0) Выход
 Способ 2: Прямые команды (для автоматизации)
-bash
+```bash
 
 # Установка
 sudo bash install-antiscanner.sh --install
-
+```
 # Удаление
 sudo bash install-antiscanner.sh --uninstall
-
+```
 # Обновление основного скрипта
 sudo bash install-antiscanner.sh --update
-
+```
 # Версии
 sudo bash install-antiscanner.sh --version
 Способ 3: Скачать через wget (без git)
-
+```
 
 wget https://raw.githubusercontent.com/olegs2026/AntiScan/main/antiscanner
 wget https://raw.githubusercontent.com/olegs2026/AntiScan/main/install-antiscanner.sh
 chmod +x install-antiscanner.sh
 sudo bash install-antiscanner.sh
+```
 🚀 Использование
 Основные команды
 
