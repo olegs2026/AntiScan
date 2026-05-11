@@ -30,7 +30,7 @@
 # Клонирование репозитория
 git clone https://github.com/olegs2026/AntiScan.git
 cd AntiScan
-bash
+```
 
 # Запуск установщика с интерактивным меню
 sudo bash install-antiscanner.sh
