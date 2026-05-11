@@ -1,6 +1,6 @@
 #!/bin/bash
-# antiscanner v3.3.6 — финальная стабильная версия для Ubuntu 22.04/24.04
-# Исправлены: счётчики ipset (без "0\n0"), shareheatsheet (без \033 raw), color_n санитизация
+# antiscanner v3.3.7 — финальная версия для Ubuntu 22.04/24.04
+# Фиксы: cmd_watch (integer expression), санитизация всех числовых переменных
 set -u
 
 BOLD='\033[1m'; DIM='\033[2m'
@@ -51,7 +51,7 @@ NOTIFY_HONEYPOT=false
 NOTIFY_FAIL2BAN=false
 HONEYPOT_COOLDOWN=25
 
-# Глобальные счётчики (защита от set -u)
+# Глобальные счётчики
 IPV4=0
 IPV6=0
 
@@ -73,14 +73,19 @@ log_info()  { echo -e "$(log_ts) [${B_GREEN}INFO${NC}] $*"; }
 log_warn()  { echo -e "$(log_ts) [${B_YELLOW}WARN${NC}] $*"; }
 log_error() { echo -e "$(log_ts) [${B_RED}ERR ${NC}] $*" >&2; }
 
-# =============== Безопасный счётчик ipset ===============
+# =============== Утилиты для безопасной работы с числами ===============
+sanitize_num() {
+    local v="${1:-0}"
+    v="${v//[^0-9]/}"
+    echo "${v:-0}"
+}
+
 ipset_count() {
     local set_name="$1"
     local cnt=0
     if ipset list "$set_name" &>/dev/null; then
         cnt=$(ipset list "$set_name" 2>/dev/null | grep -cE '^[0-9]' 2>/dev/null || true)
-        cnt="${cnt//[^0-9]/}"
-        cnt=${cnt:-0}
+        cnt=$(sanitize_num "$cnt")
     fi
     echo "$cnt"
 }
@@ -96,16 +101,12 @@ count_rules() {
         IPV4=$(iptables -S "$IPT_CHAIN" 2>/dev/null | grep -c '^-A .* -j DROP' 2>/dev/null || true)
         IPV6=$(ip6tables -S "$IPT_CHAIN" 2>/dev/null | grep -c '^-A .* -j DROP' 2>/dev/null || true)
     fi
-    IPV4="${IPV4//[^0-9]/}"
-    IPV6="${IPV6//[^0-9]/}"
-    IPV4=${IPV4:-0}
-    IPV6=${IPV6:-0}
+    IPV4=$(sanitize_num "$IPV4")
+    IPV6=$(sanitize_num "$IPV6")
 }
 
 color_n() {
-    local n="${1:-0}"
-    n="${n//[^0-9]/}"
-    n="${n:-0}"
+    local n; n=$(sanitize_num "${1:-0}")
     if [ "$n" -eq 0 ]; then
         echo -e "${B_RED}${n}${NC}"
     elif [ "$n" -lt 50 ]; then
@@ -391,13 +392,26 @@ apply_ipt() {
     ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
 }
 
-# =============== WATCH ===============
+# =============== WATCH (исправлено: безопасные числа) ===============
 cmd_watch() {
     [ ! -f "$LOG_BLOCKED" ] && exit 0
+
+    # Безопасное чтение last_pos (защита от пустого/битого WATCH_STATE)
     local last_pos=0
-    [ -f "$WATCH_STATE" ] && last_pos=$(cat "$WATCH_STATE" 2>/dev/null || echo 0)
-    local cur_size; cur_size=$(stat -c %s "$LOG_BLOCKED" 2>/dev/null || echo 0)
+    if [ -f "$WATCH_STATE" ]; then
+        local tmp_pos
+        tmp_pos=$(cat "$WATCH_STATE" 2>/dev/null || true)
+        tmp_pos=$(sanitize_num "$tmp_pos")
+        last_pos="$tmp_pos"
+    fi
+
+    # Безопасное чтение cur_size
+    local cur_size
+    cur_size=$(stat -c %s "$LOG_BLOCKED" 2>/dev/null || echo 0)
+    cur_size=$(sanitize_num "$cur_size")
+
     [ "$cur_size" -lt "$last_pos" ] && last_pos=0
+
     local now; now=$(date +%s)
     local window_start=$((now - ALERT_WINDOW))
     local new_data; new_data=$(tail -c +$((last_pos+1)) "$LOG_BLOCKED" 2>/dev/null || true)
@@ -409,6 +423,7 @@ cmd_watch() {
         local ts_str ts src dpt
         ts_str=$(echo "$line" | awk '{print $1,$2,$3}')
         ts=$(date -d "$ts_str" +%s 2>/dev/null || echo 0)
+        ts=$(sanitize_num "$ts")
         [ "$ts" -lt "$window_start" ] && continue
         src=$(echo "$line" | grep -oE 'SRC=[^ ]+' | cut -d= -f2)
         dpt=$(echo "$line" | grep -oE 'DPT=[0-9]+' | cut -d= -f2)
@@ -419,9 +434,11 @@ cmd_watch() {
     local alerts=""
     touch "$ALERTS_SEEN"
     while read -r cnt ip; do
+        cnt=$(sanitize_num "$cnt")
         [ "$cnt" -lt "$ALERT_THRESHOLD" ] && continue
-        local seen_ts; seen_ts=$(grep "^$ip " "$ALERTS_SEEN" 2>/dev/null | awk '{print $2}' || echo 0)
-        seen_ts=${seen_ts:-0}
+        local seen_ts
+        seen_ts=$(grep "^$ip " "$ALERTS_SEEN" 2>/dev/null | awk '{print $2}' | head -1 || echo 0)
+        seen_ts=$(sanitize_num "$seen_ts")
         [ $((now - seen_ts)) -lt "$ALERT_COOLDOWN" ] && continue
         local cc fl
         cc=$(geoip_lookup "$ip"); fl=$(flag_emoji "$cc")
@@ -494,6 +511,8 @@ cmd_fail2ban() {
             local new; new=$(mktemp)
             while IFS=' ' read -r ip ts secs reason; do
                 [ -z "$ip" ] && continue
+                ts=$(sanitize_num "$ts")
+                secs=$(sanitize_num "$secs")
                 if [ $((ts + secs)) -gt "$now" ]; then
                     echo "$ip $ts $secs $reason" >> "$new"
                 else
@@ -693,8 +712,7 @@ cmd_ratelimit() {
         status|*)
             local rules
             rules=$(iptables-save 2>/dev/null | grep -c 'AntiScanner-RateLimit' 2>/dev/null || true)
-            rules="${rules//[^0-9]/}"
-            rules=${rules:-0}
+            rules=$(sanitize_num "$rules")
             if [ "$rules" -gt 0 ]; then
                 echo -e "${B_GREEN}✓ Активен${NC} (правил: $rules)"
             else
@@ -720,7 +738,7 @@ cmd_status() {
 
     echo
     echo -e "${B_CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${B_CYAN}║${B_WHITE}       ANTISCANNER v3.3.6 — статус                         ${B_CYAN}║${NC}"
+    echo -e "${B_CYAN}║${B_WHITE}       ANTISCANNER v3.3.7 — статус                         ${B_CYAN}║${NC}"
     echo -e "${B_CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
     echo -e "  Режим: ${B_MAGENTA}${mode^^}${NC}"
     echo -e "  Блоклист: $(color_n "$total") (v4=$IPV4, v6=$IPV6)"
@@ -749,12 +767,16 @@ cmd_report() {
         --all|-a) since=0 ;;
         *) since=$(cat "$REPORT_STATE" 2>/dev/null || date -d '24 hours ago' +%s) ;;
     esac
+    since=$(sanitize_num "$since")
+
     local mode; mode=$(detect_mode); count_rules "$mode"
     local total=$((IPV4+IPV6))
 
     local bl_count=0 hp_count=0
     [ -f "$LOG_BLOCKED" ] && bl_count=$(wc -l <"$LOG_BLOCKED" 2>/dev/null || echo 0)
     [ -f "$LOG_HP" ] && hp_count=$(wc -l <"$LOG_HP" 2>/dev/null || echo 0)
+    bl_count=$(sanitize_num "$bl_count")
+    hp_count=$(sanitize_num "$hp_count")
 
     local msg="🛡 <b>AntiScanner Report</b>
 🖥 <code>$(hostname -s)</code>
@@ -774,7 +796,13 @@ cmd_logs() {
         alerts) tail -30 "$LOG_ALERTS" 2>/dev/null || echo "(пусто)" ;;
         f2b|fail2ban) tail -30 "$LOG_F2B" 2>/dev/null || echo "(пусто)" ;;
         honeypot|hp) tail -30 "$LOG_HP" 2>/dev/null || echo "(пусто)" ;;
-        *) echo "logs {update|blocked|alerts|f2b|honeypot}" ;;
+        clear)
+            need_root
+            for f in "$LOG_UPDATE" "$LOG_BLOCKED" "$LOG_ALERTS" "$LOG_F2B" "$LOG_HP"; do
+                [ -f "$f" ] && truncate -s 0 "$f" && echo -e "${B_GREEN}✓${NC} очищен: $f"
+            done
+            ;;
+        *) echo "logs {update|blocked|alerts|f2b|honeypot|clear}" ;;
     esac
 }
 
@@ -801,18 +829,21 @@ test_result() {
 
 cmd_test() {
     echo -e "${B_CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${B_CYAN}║${B_WHITE}         САМОДИАГНОСТИКА ANTISCANNER v3.3.6                ${B_CYAN}║${NC}"
+    echo -e "${B_CYAN}║${B_WHITE}         САМОДИАГНОСТИКА ANTISCANNER v3.3.7                ${B_CYAN}║${NC}"
     echo -e "${B_CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 
     echo -e "\n${B_WHITE}▶ Операционная система${NC}"
     if [ -f /etc/os-release ]; then
-        set +u; . /etc/os-release; set -u
-        if [ "${ID:-}" = "ubuntu" ] && [[ "${VERSION_ID:-}" =~ ^24 ]]; then
-            test_result ok "Ubuntu ${VERSION_ID}" "${PRETTY_NAME:-}"
-        elif [ "${ID:-}" = "ubuntu" ] && [[ "${VERSION_ID:-}" =~ ^22 ]]; then
-            test_result ok "Ubuntu ${VERSION_ID}" "${PRETTY_NAME:-}"
+        local os_id os_ver os_pretty
+        os_id=$(. /etc/os-release && echo "${ID:-}")
+        os_ver=$(. /etc/os-release && echo "${VERSION_ID:-}")
+        os_pretty=$(. /etc/os-release && echo "${PRETTY_NAME:-}")
+        if [ "$os_id" = "ubuntu" ] && [[ "$os_ver" =~ ^24 ]]; then
+            test_result ok "Ubuntu ${os_ver}" "$os_pretty"
+        elif [ "$os_id" = "ubuntu" ] && [[ "$os_ver" =~ ^22 ]]; then
+            test_result ok "Ubuntu ${os_ver}" "$os_pretty"
         else
-            test_result warn "ОС" "${PRETTY_NAME:-unknown}"
+            test_result warn "ОС" "$os_pretty"
         fi
     fi
 
@@ -913,7 +944,7 @@ cmd_uninstall() {
     echo -e "${B_GREEN}✔ Удалён${NC}"
 }
 
-# =============== ШПАРГАЛКА (через echo -e — БЕЗ heredoc) ===============
+# =============== ШПАРГАЛКА И HELP ===============
 show_cheatsheet() {
     echo
     echo -e "${B_CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
@@ -931,11 +962,14 @@ show_cheatsheet() {
     echo -e "${B_YELLOW}▶ Уведомления${NC}"
     echo "  antiscanner notify status"
     echo "  antiscanner notify honeypot|fail2ban|alerts|report on|off"
+    echo
+    echo -e "${B_YELLOW}▶ Очистка логов${NC}"
+    echo "  antiscanner logs clear"
 }
 
 cmd_help() {
     echo
-    echo -e "${B_CYAN}${BOLD}AntiScanner v3.3.6${NC}"
+    echo -e "${B_CYAN}${BOLD}AntiScanner v3.3.7${NC}"
     echo
     echo -e "${B_WHITE}Основные:${NC}"
     echo -e "  ${B_GREEN}update${NC} | ${B_GREEN}status${NC} | ${B_GREEN}diff${NC} | ${B_GREEN}report${NC} | ${B_GREEN}watch${NC} | ${B_GREEN}test${NC}"
