@@ -26,15 +26,15 @@
 
 ## ⚡ Быстрый старт
 
-bash
+
 # Клонирование репозитория
 git clone https://github.com/olegs2026/AntiScan.git
 cd AntiScan
-bash
-bash
+
+
 # Запуск установщика с интерактивным меню
 sudo bash install-antiscanner.sh
-bash
+
 
 🎯 Возможности
 Модуль	Описание
@@ -66,11 +66,11 @@ iputils-ping
 📥 Установка
 Способ 1: Через установщик (рекомендуется)
 
-bash
+
 git clone https://github.com/olegs2026/AntiScan.git
 cd AntiScan
 sudo bash install-antiscanner.sh
-bash
+
 
 Появится главное меню:
 
@@ -103,7 +103,7 @@ sudo bash install-antiscanner.sh --update
 # Версии
 sudo bash install-antiscanner.sh --version
 Способ 3: Скачать через wget (без git)
-bash
+
 
 wget https://raw.githubusercontent.com/olegs2026/AntiScan/main/antiscanner
 wget https://raw.githubusercontent.com/olegs2026/AntiScan/main/install-antiscanner.sh
@@ -111,14 +111,14 @@ chmod +x install-antiscanner.sh
 sudo bash install-antiscanner.sh
 🚀 Использование
 Основные команды
-bash
+
 
 antiscanner status           # Полный статус системы
 antiscanner test             # Самодиагностика (30+ проверок)
 antiscanner update           # Обновить блоклист сейчас
 antiscanner help             # Справка
 Управление модулями
-bash
+
 
 # Honeypot
 antiscanner honeypot status
@@ -138,7 +138,7 @@ antiscanner ratelimit status
 antiscanner ratelimit setup
 antiscanner ratelimit remove
 Уведомления в Telegram
-bash
+
 
 # Настройка бота (один раз)
 antiscanner telegram setup
@@ -150,7 +150,7 @@ antiscanner notify report on             # daily-report
 antiscanner notify honeypot on/off       # каждый бан honeypot
 antiscanner notify fail2ban on/off       # каждый бан fail2ban
 Whitelist (защита от самоблокировки)
-bash
+
 
 antiscanner whitelist list
 antiscanner whitelist add 192.168.1.100
