@@ -26,13 +26,15 @@
 
 ## ⚡ Быстрый старт
 
-```bash
+bash
 # Клонирование репозитория
 git clone https://github.com/olegs2026/AntiScan.git
 cd AntiScan
-
+bash
+bash
 # Запуск установщика с интерактивным меню
 sudo bash install-antiscanner.sh
+bash
 
 🎯 Возможности
 Модуль	Описание
@@ -63,11 +65,13 @@ netcat-traditional (важно для honeypot!)
 iputils-ping
 📥 Установка
 Способ 1: Через установщик (рекомендуется)
-bash
 
+bash
 git clone https://github.com/olegs2026/AntiScan.git
 cd AntiScan
 sudo bash install-antiscanner.sh
+bash
+
 Появится главное меню:
 
 ╔══════════════════════════════════════════════════════════╗
