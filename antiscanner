@@ -1,6 +1,6 @@
 #!/bin/bash
 # antiscanner v3.3.6 — финальная стабильная версия для Ubuntu 22.04/24.04
-
+# Исправлены: счётчики ipset (без "0\n0"), shareheatsheet (без \033 raw), color_n санитизация
 set -u
 
 BOLD='\033[1m'; DIM='\033[2m'
