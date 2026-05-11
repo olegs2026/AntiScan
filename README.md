@@ -26,7 +26,7 @@
 
 ## ⚡ Быстрый старт
 
-''''bash
+'''bash
 # Клонирование репозитория
 git clone https://github.com/olegs2026/AntiScan.git
 cd AntiScan
