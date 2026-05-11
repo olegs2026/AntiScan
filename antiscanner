@@ -738,7 +738,7 @@ cmd_status() {
 
     echo
     echo -e "${B_CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${B_CYAN}║${B_WHITE}       ANTISCANNER v3.3.7 — статус                         ${B_CYAN}║${NC}"
+    echo -e "${B_CYAN}║${B_WHITE}       ANTISCANNER v3.3.7 — статус                        ${B_CYAN}║${NC}"
     echo -e "${B_CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
     echo -e "  Режим: ${B_MAGENTA}${mode^^}${NC}"
     echo -e "  Блоклист: $(color_n "$total") (v4=$IPV4, v6=$IPV6)"
@@ -829,7 +829,7 @@ test_result() {
 
 cmd_test() {
     echo -e "${B_CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${B_CYAN}║${B_WHITE}         САМОДИАГНОСТИКА ANTISCANNER v3.3.7                ${B_CYAN}║${NC}"
+    echo -e "${B_CYAN}║${B_WHITE}         САМОДИАГНОСТИКА ANTISCANNER v3.3.7               ${B_CYAN}║${NC}"
     echo -e "${B_CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 
     echo -e "\n${B_WHITE}▶ Операционная система${NC}"
