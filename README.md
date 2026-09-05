@@ -47,7 +47,7 @@ sudo bash install-antiscanner.sh
 | **Rate-limit** | Не более 10 SSH-подключений в минуту с одного IP |
 | **GeoIP** | Определение страны атакующего через ipinfo.io / ip-api.com с эмодзи флагов |
 | **Telegram** | Гибкие уведомления: alerts/report включены, honeypot/fail2ban — по желанию |
-| **Whitelist** | IP/CIDR не подвергаются блокировке, защита от самоблокировки SSH |
+| **Whitelist** | IP/CIDR и доверенные порты (80, 443, диапазоны) не подвергаются блокировке, защита от ложных срабатываний и самоблокировки |
 | **Reports** | Ежедневный отчёт в TG: TOP-10 атакующих, TOP стран, TOP портов |
 
 ---
@@ -187,13 +187,27 @@ antiscanner notify honeypot on/off       # каждый бан honeypot
 antiscanner notify fail2ban on/off       # каждый бан fail2ban
 ```
 
-### Whitelist (защита от самоблокировки)
+### Whitelist (белый список IP и портов)
 
 ```bash
+# Просмотр белого списка (IP и порты)
 antiscanner whitelist list
+
+# Управление IP-адресами
 antiscanner whitelist add 192.168.1.100
-antiscanner whitelist add 10.0.0.0/24      # CIDR тоже работает
+antiscanner whitelist add 10.0.0.0/24         # CIDR тоже работает
 antiscanner whitelist del 192.168.1.100
+
+# Управление портами (одиночные порты, протоколы, диапазоны)
+antiscanner whitelist add port 80             # разрешить порт 80 (TCP/UDP)
+antiscanner whitelist add port 443/tcp        # разрешить только TCP 443
+antiscanner whitelist add port 8000:8080      # разрешить диапазон портов 8000-8080
+antiscanner whitelist del port 80             # удалить порт из белого списка
+
+# Быстрый синтаксис
+antiscanner whitelist add 80                  # автоматически распознаётся как порт
+antiscanner whitelist port list               # просмотр только списка портов
+antiscanner whitelist ip list                 # просмотр только списка IP
 ```
 
 ### GeoIP

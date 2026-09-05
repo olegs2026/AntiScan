@@ -11,6 +11,7 @@ B_WHITE='\033[1;37m'; NC='\033[0m'
 CONF_DIR="/etc/antiscanner"
 CONFIG="$CONF_DIR/config.conf"
 WHITELIST="$CONF_DIR/whitelist.txt"
+WHITELIST_PORTS="$CONF_DIR/whitelist_ports.txt"
 CURRENT="$CONF_DIR/current.list"
 PREVIOUS="$CONF_DIR/previous.list"
 LAST_DIFF="$CONF_DIR/last.diff"
@@ -59,7 +60,7 @@ IPV6=0
 if [ "$EUID" -eq 0 ]; then
     mkdir -p "$CONF_DIR" 2>/dev/null || true
     chmod 755 "$CONF_DIR" 2>/dev/null || true
-    for f in whitelist.txt current.list previous.list watch.state alerts.seen \
+    for f in whitelist.txt whitelist_ports.txt current.list previous.list watch.state alerts.seen \
              fail2ban.state fail2ban.bans geoip.cache protected.list last.diff; do
         [ ! -e "$CONF_DIR/$f" ] && touch "$CONF_DIR/$f" 2>/dev/null || true
     done
@@ -319,6 +320,75 @@ is_whitelisted() {
     return 1
 }
 
+is_valid_port() {
+    local raw="$1"
+    local proto="" p="$raw"
+    if [[ "$raw" =~ / ]]; then
+        p="${raw%%/*}"
+        proto="${raw##*/}"
+        if [[ "$proto" != "tcp" && "$proto" != "udp" && "$proto" != "all" && "$proto" != "both" ]]; then
+            return 1
+        fi
+    fi
+    # Одиночный порт 1-65535
+    if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+        return 0
+    fi
+    # Диапазон портов e.g. 8000:8080 или 8000-8080
+    if [[ "$p" =~ ^([0-9]+)[:\-]([0-9]+)$ ]]; then
+        local p1="${BASH_REMATCH[1]}"
+        local p2="${BASH_REMATCH[2]}"
+        if [ "$p1" -ge 1 ] && [ "$p1" -le 65535 ] && [ "$p2" -ge 1 ] && [ "$p2" -le 65535 ] && [ "$p1" -le "$p2" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+is_port_whitelisted() {
+    local check_port="$1" check_proto="${2:-tcp}"
+    [ ! -f "$WHITELIST_PORTS" ] && return 1
+    check_port=$(sanitize_num "$check_port")
+    [ "$check_port" -eq 0 ] && return 1
+    while IFS= read -r wp || [[ -n "$wp" ]]; do
+        wp=$(echo "$wp" | xargs)
+        [[ -z "$wp" || "$wp" == "#"* ]] && continue
+        local p_proto="all"
+        local p_num="$wp"
+        if [[ "$wp" =~ / ]]; then
+            p_num="${wp%%/*}"
+            p_proto="${wp##*/}"
+        fi
+        if [ "$p_proto" != "all" ] && [ "$p_proto" != "both" ] && [ -n "$check_proto" ] && [ "$p_proto" != "$check_proto" ]; then
+            continue
+        fi
+        # Проверка одиночного порта
+        if [[ "$p_num" =~ ^[0-9]+$ ]] && [ "$p_num" -eq "$check_port" ]; then
+            return 0
+        fi
+        # Проверка диапазона портов
+        if [[ "$p_num" =~ ^([0-9]+)[:\-]([0-9]+)$ ]]; then
+            local p_start="${BASH_REMATCH[1]}"
+            local p_end="${BASH_REMATCH[2]}"
+            if [ "$check_port" -ge "$p_start" ] && [ "$check_port" -le "$p_end" ]; then
+                return 0
+            fi
+        fi
+    done < "$WHITELIST_PORTS"
+    return 1
+}
+
+apply_current_rules() {
+    local mode; mode=$(detect_mode)
+    if [ -f "$CURRENT" ] && [ -s "$CURRENT" ]; then
+        [ "$mode" = "ufw" ] && apply_ufw "$CURRENT" || apply_ipt "$CURRENT"
+    else
+        local empty_tmp; empty_tmp=$(mktemp)
+        [ "$mode" = "ufw" ] && apply_ufw "$empty_tmp" || apply_ipt "$empty_tmp"
+        rm -f "$empty_tmp"
+    fi
+}
+
 # =============== UPDATE ===============
 cmd_update() {
     need_root
@@ -359,7 +429,7 @@ apply_ufw() {
     while IFS= read -r line; do
         num=$(echo "$line" | grep -oE '^$$\s*[0-9]+$$' | tr -d '[] ')
         [ -n "$num" ] && ufw --force delete "$num" >/dev/null 2>&1
-    done < <(ufw status numbered 2>/dev/null | grep 'AntiScanner-Block' | tac || true)
+    done < <(ufw status numbered 2>/dev/null | grep -E 'AntiScanner-Block|AntiScanner-WL-Port' | tac || true)
     while IFS= read -r s || [[ -n "$s" ]]; do
         s=$(echo "$s" | xargs)
         [[ -z "$s" || "$s" == "#"* ]] && continue
@@ -367,7 +437,22 @@ apply_ufw() {
             ufw insert 1 deny log from "$s" comment 'AntiScanner-Block' >/dev/null 2>&1 && ok=$((ok+1)) || true
         fi
     done < "$1"
-    log_info "UFW: $ok правил"
+    if [ -f "$WHITELIST_PORTS" ]; then
+        local p_ok=0
+        while IFS= read -r wp || [[ -n "$wp" ]]; do
+            wp=$(echo "$wp" | xargs)
+            [[ -z "$wp" || "$wp" == "#"* ]] && continue
+            local proto="" p_num="$wp"
+            if [[ "$wp" =~ / ]]; then
+                p_num="${wp%%/*}"
+                proto="/${wp##*/}"
+            fi
+            p_num="${p_num//:/-}"
+            ufw insert 1 allow "${p_num}${proto}" comment 'AntiScanner-WL-Port' >/dev/null 2>&1 && p_ok=$((p_ok+1)) || true
+        done < "$WHITELIST_PORTS"
+        [ "$p_ok" -gt 0 ] && log_info "UFW: $p_ok правил белого списка портов"
+    fi
+    log_info "UFW: $ok правил блоклиста"
     ufw reload >/dev/null 2>&1 || true
 }
 
@@ -377,6 +462,27 @@ apply_ipt() {
         $c -F "$IPT_CHAIN"
         $c -C INPUT -j "$IPT_CHAIN" &>/dev/null || $c -I INPUT 1 -j "$IPT_CHAIN"
     done
+    if [ -f "$WHITELIST_PORTS" ]; then
+        while IFS= read -r wp || [[ -n "$wp" ]]; do
+            wp=$(echo "$wp" | xargs)
+            [[ -z "$wp" || "$wp" == "#"* ]] && continue
+            local proto="all"
+            local p_num="$wp"
+            if [[ "$wp" =~ / ]]; then
+                p_num="${wp%%/*}"
+                proto="${wp##*/}"
+            fi
+            p_num="${p_num//-/:}"
+            for c in iptables ip6tables; do
+                if [ "$proto" = "all" ] || [ "$proto" = "both" ]; then
+                    $c -A "$IPT_CHAIN" -p tcp --dport "$p_num" -m comment --comment "AntiScanner-WL-Port" -j RETURN 2>/dev/null || true
+                    $c -A "$IPT_CHAIN" -p udp --dport "$p_num" -m comment --comment "AntiScanner-WL-Port" -j RETURN 2>/dev/null || true
+                else
+                    $c -A "$IPT_CHAIN" -p "$proto" --dport "$p_num" -m comment --comment "AntiScanner-WL-Port" -j RETURN 2>/dev/null || true
+                fi
+            done
+        done < "$WHITELIST_PORTS"
+    fi
     local c
     while IFS= read -r s || [[ -n "$s" ]]; do
         s=$(echo "$s" | xargs)
@@ -427,6 +533,7 @@ cmd_watch() {
         [ "$ts" -lt "$window_start" ] && continue
         src=$(echo "$line" | grep -oE 'SRC=[^ ]+' | cut -d= -f2)
         dpt=$(echo "$line" | grep -oE 'DPT=[0-9]+' | cut -d= -f2)
+        [ -n "$dpt" ] && is_port_whitelisted "$dpt" && continue
         [ -n "$src" ] && echo "$src $dpt" >> "$tmp"
     done
     [ ! -s "$tmp" ] && exit 0
@@ -594,7 +701,7 @@ hp_listener() {
         [ -z "$ip" ] && ip=$(ss -tn "sport = :$port" 2>/dev/null | awk 'NR>1 && $5 ~ /^[0-9]+\./ {print $5}' | cut -d: -f1 | head -1)
 
         if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-            if is_whitelisted "$ip"; then
+            if is_whitelisted "$ip" || is_port_whitelisted "$port"; then
                 :
             elif honeypot_should_notify "$ip"; then
                 echo "$(date '+%b %e %H:%M:%S') $(hostname -s) antiscanner: HONEYPOT-HIT: SRC=$ip DPT=$port PROTO=TCP" >> "$LOG_HP"
@@ -628,6 +735,10 @@ cmd_honeypot() {
             log_info "Honeypot listener: $HONEYPOT_PORTS"
             local pids=""
             for port in $HONEYPOT_PORTS; do
+                if is_port_whitelisted "$port"; then
+                    log_warn "Порт $port в белом списке — Honeypot пропущен"
+                    continue
+                fi
                 hp_listener "$port" &
                 pids="$pids $!"
             done
@@ -728,6 +839,12 @@ cmd_status() {
     count_rules "$mode"
     local total=$((IPV4 + IPV6))
 
+    local wl_ips=0 wl_ports=0
+    [ -f "$WHITELIST" ] && wl_ips=$(grep -vE '^\s*(#|$)' "$WHITELIST" 2>/dev/null | wc -l || echo 0)
+    [ -f "$WHITELIST_PORTS" ] && wl_ports=$(grep -vE '^\s*(#|$)' "$WHITELIST_PORTS" 2>/dev/null | wc -l || echo 0)
+    wl_ips=$(sanitize_num "$wl_ips")
+    wl_ports=$(sanitize_num "$wl_ports")
+
     local f2b_cnt; f2b_cnt=$(ipset_count "$IPSET_F2B")
     local hp_cnt; hp_cnt=$(ipset_count "$IPSET_HP")
 
@@ -742,6 +859,7 @@ cmd_status() {
     echo -e "${B_CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
     echo -e "  Режим: ${B_MAGENTA}${mode^^}${NC}"
     echo -e "  Блоклист: $(color_n "$total") (v4=$IPV4, v6=$IPV6)"
+    echo -e "  Whitelist: IP=$(color_n "$wl_ips"), портов=$(color_n "$wl_ports")"
     echo -e "  Fail2ban: $f2b_st (забанено: $(color_n "$f2b_cnt"))"
     echo -e "  Honeypot: $hp_st (забанено: $(color_n "$hp_cnt"))"
     echo -e "  Rate-limit: $rl_st"
@@ -807,14 +925,132 @@ cmd_logs() {
 }
 
 cmd_whitelist() {
-    local a="${1:-list}" ip="${2:-}"
-    case "$a" in
-        list) grep -vE '^\s*(#|$)' "$WHITELIST" 2>/dev/null | nl -ba || echo "(пусто)" ;;
-        add) need_root; [ -z "$ip" ] && { echo "whitelist add <ip>"; return; }
-             grep -qxF "$ip" "$WHITELIST" 2>/dev/null && { echo "уже есть"; return; }
-             echo "$ip" >> "$WHITELIST"; echo -e "${B_GREEN}✓${NC} $ip" ;;
-        del) need_root; [ -z "$ip" ] && { echo "whitelist del <ip>"; return; }
-             sed -i "\|^${ip}\s*\$|d" "$WHITELIST"; echo -e "${B_GREEN}✓${NC} удалён" ;;
+    local sub="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        list)
+            local target="${1:-all}"
+            if [ "$target" = "ip" ] || [ "$target" = "ips" ]; then
+                echo -e "${B_CYAN}═══ Белый список IP ═══${NC}"
+                grep -vE '^\s*(#|$)' "$WHITELIST" 2>/dev/null | nl -ba || echo "(пусто)"
+            elif [ "$target" = "port" ] || [ "$target" = "ports" ]; then
+                echo -e "${B_CYAN}═══ Белый список портов ═══${NC}"
+                grep -vE '^\s*(#|$)' "$WHITELIST_PORTS" 2>/dev/null | nl -ba || echo "(пусто)"
+            else
+                echo -e "${B_CYAN}═══ Белый список IP ═══${NC}"
+                if [ -s "$WHITELIST" ] && grep -qvE '^\s*(#|$)' "$WHITELIST" 2>/dev/null; then
+                    grep -vE '^\s*(#|$)' "$WHITELIST" 2>/dev/null | nl -ba
+                else
+                    echo "  (пусто)"
+                fi
+                echo
+                echo -e "${B_CYAN}═══ Белый список портов ═══${NC}"
+                if [ -s "$WHITELIST_PORTS" ] && grep -qvE '^\s*(#|$)' "$WHITELIST_PORTS" 2>/dev/null; then
+                    grep -vE '^\s*(#|$)' "$WHITELIST_PORTS" 2>/dev/null | nl -ba
+                else
+                    echo "  (пусто)"
+                fi
+            fi
+            ;;
+        ip|ips)
+            local action="${1:-list}"
+            shift 2>/dev/null || true
+            case "$action" in
+                list)
+                    echo -e "${B_CYAN}═══ Белый список IP ═══${NC}"
+                    grep -vE '^\s*(#|$)' "$WHITELIST" 2>/dev/null | nl -ba || echo "(пусто)"
+                    ;;
+                add)
+                    need_root
+                    local val="${1:-}"
+                    [ -z "$val" ] && { echo "whitelist ip add <ip|cidr>"; return 1; }
+                    grep -qxF "$val" "$WHITELIST" 2>/dev/null && { echo "уже есть в списке IP"; return 0; }
+                    echo "$val" >> "$WHITELIST"
+                    echo -e "${B_GREEN}✓ IP добавлен в белый список:${NC} $val"
+                    ;;
+                del|rm)
+                    need_root
+                    local val="${1:-}"
+                    [ -z "$val" ] && { echo "whitelist ip del <ip|cidr>"; return 1; }
+                    sed -i "\|^${val}\s*\$|d" "$WHITELIST"
+                    echo -e "${B_GREEN}✓ IP удалён из белого списка:${NC} $val"
+                    ;;
+                *)
+                    echo "antiscanner whitelist ip {list|add <ip>|del <ip>}"
+                    ;;
+            esac
+            ;;
+        port|ports)
+            local action="${1:-list}"
+            shift 2>/dev/null || true
+            case "$action" in
+                list)
+                    echo -e "${B_CYAN}═══ Белый список портов ═══${NC}"
+                    grep -vE '^\s*(#|$)' "$WHITELIST_PORTS" 2>/dev/null | nl -ba || echo "(пусто)"
+                    ;;
+                add)
+                    need_root
+                    local val="${1:-}"
+                    [ -z "$val" ] && { echo "whitelist port add <порт|диапазон> (например: 80, 443, 80/tcp, 8000:8080)"; return 1; }
+                    if ! is_valid_port "$val"; then
+                        echo -e "${B_RED}✗ Некорректный порт или диапазон:${NC} $val (примеры: 80, 443, 80/tcp, 53/udp, 8000:8080)"
+                        return 1
+                    fi
+                    grep -qxF "$val" "$WHITELIST_PORTS" 2>/dev/null && { echo "уже есть в списке портов"; return 0; }
+                    echo "$val" >> "$WHITELIST_PORTS"
+                    echo -e "${B_GREEN}✓ Порт добавлен в белый список:${NC} $val"
+                    apply_current_rules
+                    ;;
+                del|rm)
+                    need_root
+                    local val="${1:-}"
+                    [ -z "$val" ] && { echo "whitelist port del <порт>"; return 1; }
+                    sed -i "\|^${val}\s*\$|d" "$WHITELIST_PORTS"
+                    echo -e "${B_GREEN}✓ Порт удалён из белого списка:${NC} $val"
+                    apply_current_rules
+                    ;;
+                *)
+                    echo "antiscanner whitelist port {list|add <port>|del <port>}"
+                    ;;
+            esac
+            ;;
+        add)
+            need_root
+            local arg1="${1:-}" arg2="${2:-}"
+            if [ "$arg1" = "port" ] || [ "$arg1" = "ports" ] || [ "$arg1" = "-p" ]; then
+                cmd_whitelist port add "$arg2"
+            elif [ "$arg1" = "ip" ] || [ "$arg1" = "ips" ]; then
+                cmd_whitelist ip add "$arg2"
+            elif is_valid_port "$arg1" && [[ ! "$arg1" =~ \. && ! "$arg1" =~ :.*: ]]; then
+                cmd_whitelist port add "$arg1"
+            elif [ -n "$arg1" ]; then
+                cmd_whitelist ip add "$arg1"
+            else
+                echo "antiscanner whitelist add [ip|port] <значение>"
+                echo "  Примеры: antiscanner whitelist add 1.2.3.4"
+                echo "           antiscanner whitelist add port 80"
+                echo "           antiscanner whitelist add 8000:8080"
+            fi
+            ;;
+        del|rm)
+            need_root
+            local arg1="${1:-}" arg2="${2:-}"
+            if [ "$arg1" = "port" ] || [ "$arg1" = "ports" ] || [ "$arg1" = "-p" ]; then
+                cmd_whitelist port del "$arg2"
+            elif [ "$arg1" = "ip" ] || [ "$arg1" = "ips" ]; then
+                cmd_whitelist ip del "$arg2"
+            elif is_valid_port "$arg1" && grep -qxF "$arg1" "$WHITELIST_PORTS" 2>/dev/null; then
+                cmd_whitelist port del "$arg1"
+            elif [ -n "$arg1" ]; then
+                cmd_whitelist ip del "$arg1"
+            else
+                echo "antiscanner whitelist del [ip|port] <значение>"
+            fi
+            ;;
+        *)
+            echo "antiscanner whitelist {list|add|del|ip|port}"
+            ;;
     esac
 }
 
@@ -865,6 +1101,13 @@ cmd_test() {
     else
         test_result warn "Блоклист" "0 правил"
     fi
+
+    echo -e "\n${B_WHITE}▶ Белые списки (Whitelist)${NC}"
+    local wl_ips=0 wl_ports=0
+    [ -f "$WHITELIST" ] && wl_ips=$(grep -vE '^\s*(#|$)' "$WHITELIST" 2>/dev/null | wc -l || echo 0)
+    [ -f "$WHITELIST_PORTS" ] && wl_ports=$(grep -vE '^\s*(#|$)' "$WHITELIST_PORTS" 2>/dev/null | wc -l || echo 0)
+    test_result info "IP в белом списке" "$wl_ips"
+    test_result info "Портов в белом списке" "$wl_ports"
 
     echo -e "\n${B_WHITE}▶ Сервисы${NC}"
     for s in antiscanner-fail2ban antiscanner-honeypot antiscanner-update antiscanner-unban.timer; do
@@ -951,6 +1194,11 @@ show_cheatsheet() {
     echo -e "${B_CYAN}║${B_WHITE}  🧾 ШПАРГАЛКА                                              ${B_CYAN}║${NC}"
     echo -e "${B_CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
     echo
+    echo -e "${B_YELLOW}▶ Whitelist (IP и порты)${NC}"
+    echo "  antiscanner whitelist list"
+    echo "  antiscanner whitelist add <ip> | add port <порт>"
+    echo "  antiscanner whitelist del <ip> | del port <порт>"
+    echo
     echo -e "${B_YELLOW}▶ Honeypot${NC}"
     echo "  antiscanner honeypot disable|enable"
     echo "  antiscanner honeypot silent|verbose"
@@ -983,7 +1231,8 @@ cmd_help() {
     echo -e "  ${B_GREEN}notify${NC} status | ${B_GREEN}notify${NC} alerts|report|honeypot|fail2ban on|off"
     echo
     echo -e "${B_WHITE}Утилиты:${NC}"
-    echo -e "  ${B_GREEN}whitelist${NC} | ${B_GREEN}telegram${NC} | ${B_GREEN}geoip${NC} | ${B_GREEN}logs${NC} | ${B_GREEN}uninstall${NC}"
+    echo -e "  ${B_GREEN}whitelist${NC} list | add [ip|port] <val> | del [ip|port] <val> | ip | port"
+    echo -e "  ${B_GREEN}telegram${NC}  | ${B_GREEN}geoip${NC} | ${B_GREEN}logs${NC} | ${B_GREEN}uninstall${NC}"
     echo
     echo -e "${B_WHITE}Конфиг:${NC} $CONFIG"
     show_cheatsheet

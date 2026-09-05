@@ -334,7 +334,7 @@ create_config() {
     mkdir -p "$CONF_DIR"
     chmod 755 "$CONF_DIR"
 
-    for f in whitelist.txt current.list previous.list watch.state alerts.seen \
+    for f in whitelist.txt whitelist_ports.txt current.list previous.list watch.state alerts.seen \
              fail2ban.state fail2ban.bans geoip.cache protected.list last.diff; do
         touch "$CONF_DIR/$f"
     done
